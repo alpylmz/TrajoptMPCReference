@@ -2,11 +2,13 @@ import importlib
 import numpy as np
 import copy
 import enum
+import time
+import sys
 from TrajoptPlant import TrajoptPlant, DoubleIntegratorPlant, PendulumPlant, CartPolePlant, URDFPlant
 from TrajoptCost import TrajoptCost, QuadraticCost
 from TrajoptConstraint import TrajoptConstraint, BoxConstraint
 PCG = importlib.import_module("GBD-PCG-Python").PCG
-np.set_printoptions(precision=4, suppress=True, linewidth = 100)
+np.set_printoptions(precision=4, suppress=True, linewidth = 100, threshold=sys.maxsize)
 
 class SQPSolverMethods(enum.Enum):
     N = "N"
@@ -83,6 +85,8 @@ class TrajoptMPCReference:
         options.setdefault('simulator_steps_mpc', 1)
 
     def formKKTSystemBlocks(self, x: np.ndarray, u: np.ndarray, xs: np.ndarray, N: int, dt: float):
+        start = time.time()
+        print("formKKTSystemBlocks")
         nq = self.plant.get_num_pos()
         nv = self.plant.get_num_vel()
         nu = self.plant.get_num_cntrl()
@@ -92,6 +96,8 @@ class TrajoptMPCReference:
         total_states_controls = n*(N-1) + nx
         G = np.zeros((total_states_controls, total_states_controls))
         g = np.zeros((total_states_controls, 1))
+        print("G size: ", G.shape)
+        print("g size: ", g.shape)
         # C,c are constraint gradient (Jacobian) and value and depends on both the
         #     N-1 dynamics constarints, the initial state constaint, and any additional constraints
         total_dynamics_intial_state_constraints = nx*N
@@ -99,16 +105,14 @@ class TrajoptMPCReference:
         total_constraints = total_dynamics_intial_state_constraints + total_other_constraints
         C = np.zeros((total_constraints, total_states_controls))
         c = np.zeros((total_constraints, 1))
-
+        print("C size: ", C.shape)
+        print("c size: ", c.shape)
         # start filling from the top left of the matricies (and top of vectors)
-        constraint_index = 0
         state_control_index = 0
-        # begin with the initial state constraint
-        C[constraint_index:constraint_index + nx, state_control_index:state_control_index + nx] = np.eye(nx)
-        c[constraint_index:constraint_index + nx, 0] = x[:,0] - xs
-        constraint_index += nx
         for k in range(N-1):
             # first load in the cost hessian and gradient
+            # If this was C, I would write this in another loop, that would be more efficient for cache usage
+            # But I am not sure if it will be efficient here
             G[state_control_index:state_control_index + n, \
               state_control_index:state_control_index + n] = self.cost.hessian(x[:,k], u[:,k], k)
             g[state_control_index:state_control_index + n, 0] = self.cost.gradient(x[:,k], u[:,k], k)
@@ -118,7 +122,32 @@ class TrajoptMPCReference:
                 g[state_control_index:state_control_index + n, :] += gck
                 G[state_control_index:state_control_index + n, \
                   state_control_index:state_control_index + n] += np.outer(gck,gck)
-
+                
+            state_control_index += n
+        
+        # finish with the final cost
+        G[state_control_index:state_control_index + nx, \
+          state_control_index:state_control_index + nx] = self.cost.hessian(x[:,N-1], timestep = N-1)
+        g[state_control_index:state_control_index + nx, 0] = self.cost.gradient(x[:,N-1], timestep = N-1)
+        # add soft constraints if applicable
+        if self.other_constraints.total_soft_constraints(timestep = N-1) > 0:
+            gcNm1 = self.other_constraints.jacobian_soft_constraints(x[:,N-1], timestep = N-1)
+            g[state_control_index:state_control_index + nx, :] += gcNm1
+            G[state_control_index:state_control_index + nx, \
+              state_control_index:state_control_index + nx] += np.outer(gcNm1,gcNm1)
+            
+        constraint_index = 0
+        state_control_index = 0
+        # begin with the initial state constraint
+        # make the first nx*nx block of G the identity matrix
+        C[:nx, :nx] = np.eye(nx)
+        # make the first nx block of c the difference between the initial state and xs
+        # because the first row of x should be the initial state already, but why x[:, 0]? Shouldn't that be x[0]?
+        # It is x[:, 0], because x is the transpose of what I thought firstly
+        # but why this is a constraint here, can't we put it as a hardcoded number? TODO:
+        c[:nx, 0] = x[:,0] - xs
+        constraint_index += nx
+        for k in range(N-1):
             # then load in the constraints for this timestep starting with dynamics
             Ak, Bk = self.plant.integrator(x[:,k], u[:,k], dt, return_gradient = True)
             C[constraint_index:constraint_index + nx, \
@@ -141,17 +170,6 @@ class TrajoptMPCReference:
             # then update the state_control_index
             state_control_index += n
 
-        # finish with the final cost
-        G[state_control_index:state_control_index + nx, \
-          state_control_index:state_control_index + nx] = self.cost.hessian(x[:,N-1], timestep = N-1)
-        g[state_control_index:state_control_index + nx, 0] = self.cost.gradient(x[:,N-1], timestep = N-1)
-        # add soft constraints if applicable
-        if self.other_constraints.total_soft_constraints(timestep = N-1) > 0:
-            gcNm1 = self.other_constraints.jacobian_soft_constraints(x[:,N-1], timestep = N-1)
-            g[state_control_index:state_control_index + nx, :] += gcNm1
-            G[state_control_index:state_control_index + nx, \
-              state_control_index:state_control_index + nx] += np.outer(gcNm1,gcNm1)
-
         # and the final constraint
         if total_other_constraints > 0 and self.other_constraints.total_hard_constraints(x, u, N-1):
             jac = self.other_constraints.jacobian_hard_constraints(x[:,N-1], timestep = N-1)
@@ -162,19 +180,31 @@ class TrajoptMPCReference:
                   state_control_index:state_control_index + nx] = np.reshape(jac, (num_active_const_k,nx))
                 c[constraint_index:constraint_index + num_active_const_k] = np.reshape(val, (num_active_const_k,1))
 
+        print("G: ", G)
+        print("g: ", g)
+        print("C: ", C)
+        print("c: ", c)
+        print("time: ", time.time() - start)
         return G, g, C, c
 
     def totalHardConstraintViolation(self, x: np.ndarray, u: np.ndarray, xs: np.ndarray, N: int, dt: float, mode = None):
+        """
+        x: the states for N timesteps
+        xs: the initial state
+        u: the control input for N-1 timesteps
+        N: the number of timesteps
+        dt: the time step size
+        """
         mode_func = sum
         if mode == "MAX":
             mode_func = max
         # first do initial state and dynamics
-        x_err = x[:,0] - xs
-        err = list(map(abs,x_err))
-        c = mode_func(err)
+        x_err = x[:,0] - xs # How much x changed while searching for a solution?
+        err = list(map(abs,x_err)) # take abs of err
+        c = mode_func(err) # sum or max of the error, depends on the mode
         for k in range(N-1):
-            xkp1 = self.plant.integrator(x[:,k], u[:,k], dt)
-            x_err = x[:,k+1] - xkp1
+            xkp1 = self.plant.integrator(x[:,k], u[:,k], dt) # what happens x after u is applied for dt time?
+            x_err = x[:,k+1] - xkp1 # I did not understand this
             c += mode_func(list(map(abs,x_err)))
         # then do all other constraints
         if self.other_constraints.total_hard_constraints(x, u) > 0:
@@ -202,22 +232,25 @@ class TrajoptMPCReference:
     def solveKKTSystem(self, x: np.ndarray, u: np.ndarray, xs: np.ndarray, N: int, dt: float, rho: float = 0.0, options = {}):
         nq = self.plant.get_num_pos()
         nv = self.plant.get_num_vel()
-        nu = self.plant.get_num_cntrl()
         nx = nq + nv
-        n = nx + nu
         
         G, g, C, c = self.formKKTSystemBlocks(x, u, xs, N, dt)
 
-        total_dynamics_intial_state_constraints = nx*N
+        total_dynamics_intial_state_constraints = nx * N
         total_other_constraints = self.other_constraints.total_hard_constraints(x, u)
         total_constraints = total_dynamics_intial_state_constraints + total_other_constraints
         BR = np.zeros((total_constraints,total_constraints))
 
+        # TODO: why
         if rho != 0:
             G += rho * np.eye(G.shape[0])
 
+        # Schur diff
         KKT = np.hstack((np.vstack((G, C)),np.vstack((C.transpose(), BR))))
         kkt = np.vstack((g, c))
+        # ----------
+        print("KKT: ", KKT)
+        print("kkt: ", kkt)
 
         try:
             dxul = np.linalg.solve(KKT, kkt)
@@ -244,9 +277,11 @@ class TrajoptMPCReference:
         if rho != 0:
             G += rho * np.eye(G.shape[0])
 
+        # Schur diff
         invG = np.linalg.inv(G)
         S = BR - np.matmul(C, np.matmul(invG, C.transpose()))
         gamma = c - np.matmul(C, np.matmul(invG, g))
+        # ------------
 
         if not use_PCG:
             try:
@@ -329,6 +364,13 @@ class TrajoptMPCReference:
         return exit_flag, iteration
 
     def SQP(self, x: np.ndarray, u: np.ndarray, N: int, dt: float, LINEAR_SYSTEM_SOLVER_METHOD: SQPSolverMethods = SQPSolverMethods.N, options = {}):
+        """
+        x: the states for N timesteps
+        u: the controls for N-1 timesteps
+        N: the number of timesteps
+        dt: the time step size
+        the goal is embedded in the cost function
+        """
         self.set_default_options(options)
         options_linSys = {'DEBUG_MODE': options['DEBUG_MODE_linSys']}
 
@@ -345,11 +387,22 @@ class TrajoptMPCReference:
         nx = nq + nv
         n = nx + nu
 
-        xs = copy.deepcopy(x[:,0])
+        # xs is the initial state for the problem
+        xs = copy.deepcopy(x[:,0]) 
+
+        print("nq: ", nq)
+        print("nv: ", nv)
+        print("nu: ", nu)
+        print("nx: ", nx)
+        print("n: ", n)
+        print("x: ", x)
+        print("xs: ", xs)
 
         # Start the main loops (soft constraint outer loop)
         soft_constraint_iteration = 0
+        print("starting iterations")
         while 1:
+
             # Initialize the QP solve
             J = 0
             c = 0
@@ -357,13 +410,17 @@ class TrajoptMPCReference:
             drho = 1
 
             # Compute initial cost and constraint violation
-            J = self.totalCost(x, u, N)
+            # This function just applies u to x and computes the cost
+            J = self.totalCost(x, u, N) # Number, not a function
+            print("J: ", J)
+            # ??????????????????????????????????????????????????????????????????????????
             c = self.totalHardConstraintViolation(x, u, xs, N, dt)
 
             # L1 merit function with balanced J and c
+            # What are these two lines?
             mu = J/c if c != 0 else 10
-            mu = 10
-            merit = J + mu*c
+            mu = 10 # If this line is deleted then the code will not work
+            merit = J + mu*c # cost plus constant * constraint violation
             if options['DEBUG_MODE_SQP_DDP']:
                 print("Initial Cost, Constraint Violation, Merit Function: ", J, c, merit)
             if options['RETURN_TRACE_SQP']:
@@ -373,6 +430,9 @@ class TrajoptMPCReference:
             # Start the main loop (SQP main loop)
             iteration = 0
             while 1:
+                print("new iteration")
+                print("x: ", x)
+                print("u: ", u)
 
                 #
                 # Solve QP to get step direction
@@ -810,7 +870,7 @@ class TrajoptMPCReference:
                 sqp_solver = SQPSolverMethods(SOLVER_METHOD.value[3:])
                 x, u = self.SQP(x, u, N, dt, sqp_solver, options)
                 K = self.LQR_tracking(x, u, xs, N, dt)
-            elif SOLVER_METHOD == "iLQR":
+            elif SOLVER_METHOD == MPCSolverMethods.iLQR:
                 x, u, K = self.iLQR(x, u, N, dt, options)
             else:
                 print("Invalid solver options are:\n", \
