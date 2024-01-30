@@ -12,6 +12,12 @@ class TrajoptCost:
 
 class QuadraticCost(TrajoptCost):
 	def __init__(self, Q_in: np.ndarray, QF_in: np.ndarray, R_in: np.ndarray, xg_in: np.ndarray, QF_start = None):
+		"""
+		Q_in: Quadratic cost on state, x^T Q x
+		QF_in: Quadratic cost on final state, (x - xg)^T QF (x - xg), this is to make sure that the final state is *really* close to goal
+		R_in: Quadratic cost on control, u^T R u
+		xg_in: Goal state
+		"""
 		self.Q = Q_in
 		self.QF = QF_in
 		self.R = R_in
